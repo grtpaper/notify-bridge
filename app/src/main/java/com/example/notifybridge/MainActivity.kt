@@ -3,6 +3,7 @@ package com.example.notifybridge
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.BluetoothLeScanner
@@ -29,6 +30,10 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 
 /**
  * One screen for both roles. The first time the app opens you pick whether this device is the
@@ -46,6 +51,10 @@ class MainActivity : Activity() {
     private var statusView: TextView? = null
     private var startStopButton: Button? = null
     private var foundAdapter: ArrayAdapter<String>? = null
+    private var messagesAdapter: ArrayAdapter<String>? = null
+    private var shownHistoryVersion = -1
+    private var receiverSetup: Boolean? = null // null = decide automatically
+    private var showingSetup = false
     private var scanner: BluetoothLeScanner? = null
     private var pendingAction: (() -> Unit)? = null
     private val found = LinkedHashMap<String, String>() // address -> name
@@ -54,6 +63,7 @@ class MainActivity : Activity() {
     private val tick = object : Runnable {
         override fun run() {
             updateStatus()
+            if (messagesAdapter != null && History.version != shownHistoryVersion) refreshMessages()
             ui.postDelayed(this, 1000)
         }
     }
@@ -91,6 +101,7 @@ class MainActivity : Activity() {
         statusView = null
         startStopButton = null
         foundAdapter = null
+        messagesAdapter = null
         root.addView(label("Notify Bridge", 24f, bold = true))
         when (prefs.mode) {
             Prefs.MODE_SENDER -> renderSender()
@@ -131,6 +142,38 @@ class MainActivity : Activity() {
     }
 
     private fun renderReceiver() {
+        val setup = receiverSetup ?: (prefs.peerAddress == null)
+        if (setup) renderReceiverSetup() else renderMessages()
+    }
+
+    private fun renderMessages() {
+        showingSetup = false
+        root.addView(label("Role: e-reader (receiver)", bold = true))
+        statusView = label("").also { root.addView(it) }
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.addView(
+            button("Setup") {
+                receiverSetup = true
+                render()
+            },
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        row.addView(
+            button("Clear all") { confirmClear() },
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        root.addView(row)
+        val adapter = ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, ArrayList<String>())
+        messagesAdapter = adapter
+        val list = ListView(this)
+        list.adapter = adapter
+        root.addView(list, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        refreshMessages()
+    }
+
+    private fun renderReceiverSetup() {
+        showingSetup = true
         root.addView(label("Role: e-reader (receiver)", bold = true))
         statusView = label("").also { root.addView(it) }
         root.addView(label("First open Notify Bridge on the phone and press Start there."))
@@ -144,6 +187,10 @@ class MainActivity : Activity() {
         list.adapter = adapter
         list.setOnItemClickListener { _, _, position, _ -> pickPhone(position) }
         root.addView(list, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(button("Back to messages") {
+            receiverSetup = false
+            render()
+        })
         root.addView(button("Change role") { changeRole() })
     }
 
@@ -205,6 +252,7 @@ class MainActivity : Activity() {
     private fun changeRole() {
         stopBridge()
         prefs.mode = null
+        receiverSetup = null
         render()
     }
 
@@ -392,7 +440,7 @@ class MainActivity : Activity() {
                     .append('\n')
                     .append("Status: ")
                     .append(if (prefs.running) Bridge.receiverStatus else "stopped")
-                if (Build.VERSION.SDK_INT >= 33 &&
+                if (showingSetup && Build.VERSION.SDK_INT >= 33 &&
                     checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
                 ) {
                     sb.append("\nNotifications are blocked - allow them in Android settings")
@@ -400,6 +448,48 @@ class MainActivity : Activity() {
             }
         }
         view.text = sb.toString()
+    }
+
+    // ---- e-reader: saved messages ----
+
+    private fun confirmClear() {
+        AlertDialog.Builder(this)
+            .setMessage("Delete all saved messages?")
+            .setPositiveButton("Delete") { _, _ ->
+                History.clear(this)
+                refreshMessages()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun refreshMessages() {
+        val a = messagesAdapter ?: return
+        val items = History.all(this)
+        shownHistoryVersion = History.version
+        a.clear()
+        if (items.isEmpty()) {
+            a.add("No messages yet.")
+        } else {
+            a.addAll(items.map { formatMessage(it) })
+        }
+        a.notifyDataSetChanged()
+    }
+
+    private fun formatMessage(m: Message): String {
+        val head = if (m.title.isBlank()) m.app else "${m.app}: ${m.title}"
+        val first = "${formatTime(m.time)}  $head"
+        return if (m.text.isBlank()) first else "$first\n${m.text}"
+    }
+
+    private fun formatTime(millis: Long): String {
+        val now = Calendar.getInstance()
+        val then = Calendar.getInstance()
+        then.timeInMillis = millis
+        val sameDay = now.get(Calendar.YEAR) == then.get(Calendar.YEAR) &&
+            now.get(Calendar.DAY_OF_YEAR) == then.get(Calendar.DAY_OF_YEAR)
+        val pattern = if (sameDay) "HH:mm" else "d MMM HH:mm"
+        return SimpleDateFormat(pattern, Locale.getDefault()).format(Date(millis))
     }
 
     // ---- small view helpers ----

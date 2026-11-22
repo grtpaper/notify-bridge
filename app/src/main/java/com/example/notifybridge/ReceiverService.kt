@@ -198,6 +198,7 @@ class ReceiverService : Service() {
         main.post {
             val payload = reassembler.feed(copy) ?: return@post
             val message = Protocol.decode(payload) ?: return@post
+            History.add(this, message)
             showNotification(message)
         }
     }
