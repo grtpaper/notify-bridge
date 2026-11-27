@@ -56,20 +56,26 @@ class Prefs(context: Context) {
         }
 
     /**
-     * Receiver only: find the phone by scanning and connect to the address it is using right now,
-     * instead of waiting for Android to match a saved pairing. Fixes phones that stop reconnecting.
+     * Both roles: use a shared security code instead of Bluetooth pairing. The same setting and the
+     * same code must be used on the phone and the e-reader.
      */
-    var directConnect: Boolean
-        get() = p.getBoolean("directConnect", true)
+    var useCode: Boolean
+        get() = p.getBoolean("useCode", false)
         set(v) {
-            p.edit().putBoolean("directConnect", v).apply()
+            p.edit().putBoolean("useCode", v).apply()
         }
 
-    /** Receiver only: when connecting keeps failing, delete the phone's old pairing and pair again. */
-    var autoFixPairing: Boolean
-        get() = p.getBoolean("autoFixPairing", true)
+    var code: String
+        get() = p.getString("code", "") ?: ""
         set(v) {
-            p.edit().putBoolean("autoFixPairing", v).apply()
+            p.edit().putString("code", v).apply()
+        }
+
+    /** Both roles: record connection events for the Log screen. */
+    var logEnabled: Boolean
+        get() = p.getBoolean("logEnabled", false)
+        set(v) {
+            p.edit().putBoolean("logEnabled", v).apply()
         }
 }
 

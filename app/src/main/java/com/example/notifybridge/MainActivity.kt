@@ -11,7 +11,11 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -19,15 +23,21 @@ import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
+import android.provider.MediaStore
 import android.provider.Settings
+import android.text.InputType
+import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import java.text.SimpleDateFormat
@@ -38,17 +48,24 @@ import java.util.Locale
 /**
  * One screen for both roles. The first time the app opens you pick whether this device is the
  * phone (sender) or the e-reader (receiver). The UI is plain black-on-white for e-ink screens.
+ * A Settings screen holds two options: a shared security code (instead of Bluetooth pairing) and
+ * a log screen for troubleshooting.
  */
 @SuppressLint("MissingPermission")
 class MainActivity : Activity() {
 
     private companion object {
         const val REQ_PERMS = 1
+        const val SCREEN_MAIN = 0
+        const val SCREEN_SETTINGS = 1
+        const val SCREEN_LOG = 2
     }
 
     private lateinit var prefs: Prefs
     private lateinit var root: LinearLayout
+    private var screen = SCREEN_MAIN
     private var statusView: TextView? = null
+    private var codeView: TextView? = null
     private var startStopButton: Button? = null
     private var foundAdapter: ArrayAdapter<String>? = null
     private var messagesAdapter: ArrayAdapter<String>? = null
@@ -93,20 +110,40 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        when (screen) {
+            SCREEN_LOG -> {
+                screen = SCREEN_SETTINGS
+                render()
+            }
+            SCREEN_SETTINGS -> {
+                screen = SCREEN_MAIN
+                render()
+            }
+            else -> super.onBackPressed()
+        }
+    }
+
     // ---- screens ----
 
     private fun render() {
         stopScan()
         root.removeAllViews()
         statusView = null
+        codeView = null
         startStopButton = null
         foundAdapter = null
         messagesAdapter = null
         root.addView(label("Notify Bridge", 24f, bold = true))
-        when (prefs.mode) {
-            Prefs.MODE_SENDER -> renderSender()
-            Prefs.MODE_RECEIVER -> renderReceiver()
-            else -> renderChooser()
+        if (prefs.mode == null) {
+            renderChooser()
+        } else {
+            when (screen) {
+                SCREEN_SETTINGS -> renderSettings()
+                SCREEN_LOG -> renderLog()
+                else -> if (prefs.mode == Prefs.MODE_SENDER) renderSender() else renderReceiver()
+            }
         }
         updateStatus()
     }
@@ -138,7 +175,7 @@ class MainActivity : Activity() {
         root.addView(button("Send test notification") { sendTest() })
         root.addView(label("Apps to forward (tap to choose):", bold = true))
         addAppList()
-        root.addView(button("Change role") { changeRole() })
+        root.addView(buttonRow("Settings" to { openSettings() }, "Change role" to { changeRole() }))
     }
 
     private fun renderReceiver() {
@@ -150,20 +187,16 @@ class MainActivity : Activity() {
         showingSetup = false
         root.addView(label("Role: e-reader (receiver)", bold = true))
         statusView = label("").also { root.addView(it) }
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-        row.addView(
-            button("Setup") {
-                receiverSetup = true
-                render()
-            },
-            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        root.addView(
+            buttonRow(
+                "Setup" to {
+                    receiverSetup = true
+                    render()
+                },
+                "Settings" to { openSettings() },
+                "Clear all" to { confirmClear() }
+            )
         )
-        row.addView(
-            button("Clear all") { confirmClear() },
-            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        )
-        root.addView(row)
         val adapter = ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, ArrayList<String>())
         messagesAdapter = adapter
         val list = ListView(this)
@@ -180,21 +213,6 @@ class MainActivity : Activity() {
         root.addView(button("1. Find phone") { startScan() })
         root.addView(button("2. Allow background running") { openBatterySettings() })
         startStopButton = button("3. Start") { toggleBridge() }.also { root.addView(it) }
-        root.addView(CheckBox(this).apply {
-            text = "Reconnect by scanning (turn off to use the old method)"
-            setTextColor(Color.BLACK)
-            isChecked = prefs.directConnect
-            setOnCheckedChangeListener { _, checked ->
-                prefs.directConnect = checked
-                applySettingsNow()
-            }
-        })
-        root.addView(CheckBox(this).apply {
-            text = "Fix a broken pairing automatically (may also remove the phone's pairing used for internet sharing)"
-            setTextColor(Color.BLACK)
-            isChecked = prefs.autoFixPairing
-            setOnCheckedChangeListener { _, checked -> prefs.autoFixPairing = checked }
-        })
         root.addView(label("Phones found (tap yours):", bold = true))
         val adapter = ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, ArrayList<String>())
         foundAdapter = adapter
@@ -202,10 +220,15 @@ class MainActivity : Activity() {
         list.adapter = adapter
         list.setOnItemClickListener { _, _, position, _ -> pickPhone(position) }
         root.addView(list, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
-        root.addView(button("Back to messages") {
-            receiverSetup = false
-            render()
-        })
+        root.addView(
+            buttonRow(
+                "Back to messages" to {
+                    receiverSetup = false
+                    render()
+                },
+                "Settings" to { openSettings() }
+            )
+        )
         root.addView(button("Change role") { changeRole() })
     }
 
@@ -234,6 +257,184 @@ class MainActivity : Activity() {
         root.addView(list, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
     }
 
+    // ---- settings screen ----
+
+    private fun openSettings() {
+        screen = SCREEN_SETTINGS
+        render()
+    }
+
+    private fun renderSettings() {
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        val scroll = ScrollView(this)
+        scroll.addView(box)
+        root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        box.addView(label("Settings", 20f, bold = true))
+
+        box.addView(label("Security code", bold = true))
+        box.addView(
+            label(
+                "Use a secret code instead of Bluetooth pairing. Turn this on and enter the same code on " +
+                    "both the phone and the e-reader. Messages are encrypted with the code, so nothing is " +
+                    "paired and old pairings stop mattering. Use at least ${Crypto.MIN_CODE_LENGTH} " +
+                    "characters; longer and less guessable is safer.",
+                14f
+            )
+        )
+        box.addView(CheckBox(this).apply {
+            text = "Use a security code instead of Bluetooth pairing"
+            setTextColor(Color.BLACK)
+            isChecked = prefs.useCode
+            setOnCheckedChangeListener { _, checked ->
+                prefs.useCode = checked
+                if (checked && !Crypto.isValidCode(prefs.code)) toast("Now set the security code")
+                restartBridge()
+            }
+        })
+        codeView = label(codeStatusText()).also { box.addView(it) }
+        box.addView(button("Set security code") { askCode() })
+
+        box.addView(label("Log screen", bold = true))
+        box.addView(
+            label(
+                "Records connection steps (scans, errors, pairing, messages sent or received) so problems " +
+                    "can be found. Turn it on only while troubleshooting.",
+                14f
+            )
+        )
+        box.addView(CheckBox(this).apply {
+            text = "Record a log and show the log screen"
+            setTextColor(Color.BLACK)
+            isChecked = prefs.logEnabled
+            setOnCheckedChangeListener { _, checked ->
+                prefs.logEnabled = checked
+                render()
+            }
+        })
+        if (prefs.logEnabled) {
+            box.addView(button("View log") {
+                screen = SCREEN_LOG
+                render()
+            })
+        }
+        box.addView(button("Back") {
+            screen = SCREEN_MAIN
+            render()
+        })
+    }
+
+    private fun codeStatusText(): String =
+        if (Crypto.isValidCode(prefs.code)) "Security code: set (${prefs.code.length} characters)"
+        else "Security code: not set"
+
+    private fun askCode() {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT
+            hint = "At least ${Crypto.MIN_CODE_LENGTH} characters"
+            setText(prefs.code)
+            setSingleLine()
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Security code")
+            .setMessage("Enter the same code on the phone and the e-reader.")
+            .setView(input)
+            .setPositiveButton("Save") { _, _ ->
+                val value = input.text.toString().trim()
+                if (!Crypto.isValidCode(value)) {
+                    toast("Too short: use at least ${Crypto.MIN_CODE_LENGTH} characters")
+                } else {
+                    prefs.code = value
+                    codeView?.text = codeStatusText()
+                    toast("Code saved")
+                    restartBridge()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // ---- log screen ----
+
+    private fun renderLog() {
+        root.addView(label("Log", 20f, bold = true))
+        val text = AppLog.read(this)
+        val body = TextView(this).apply {
+            this.text = if (text.isBlank()) "(empty - lines appear while the bridge runs)" else text
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
+            setTextColor(Color.BLACK)
+            setTextIsSelectable(true)
+        }
+        val scroll = ScrollView(this)
+        scroll.addView(body)
+        root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+        root.addView(
+            buttonRow(
+                "Refresh" to { render() },
+                "Copy" to { copyLog() },
+                "Share" to { shareLog() }
+            )
+        )
+        root.addView(
+            buttonRow(
+                "Save file" to { saveLogToDownloads() },
+                "Clear" to {
+                    AppLog.clear(this)
+                    render()
+                },
+                "Back" to {
+                    screen = SCREEN_SETTINGS
+                    render()
+                }
+            )
+        )
+    }
+
+    private fun copyLog() {
+        val cm = getSystemService(ClipboardManager::class.java)
+        cm.setPrimaryClip(ClipData.newPlainText("Notify Bridge log", AppLog.read(this)))
+        toast("Log copied")
+    }
+
+    private fun shareLog() {
+        val intent = Intent(Intent.ACTION_SEND)
+            .setType("text/plain")
+            .putExtra(Intent.EXTRA_SUBJECT, "Notify Bridge log")
+            .putExtra(Intent.EXTRA_TEXT, AppLog.read(this).takeLast(40_000))
+        try {
+            startActivity(Intent.createChooser(intent, "Share log"))
+        } catch (e: ActivityNotFoundException) {
+            toast("No app to share with. Use Copy or Save file.")
+        }
+    }
+
+    /** Saves the log as a text file in the Downloads folder (Android 10 and newer). */
+    private fun saveLogToDownloads() {
+        if (Build.VERSION.SDK_INT < 29) {
+            toast("Saving a file needs Android 10 or newer. Use Copy or Share.")
+            return
+        }
+        try {
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, "notify-bridge-log-${System.currentTimeMillis() / 1000}.txt")
+                put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            if (uri == null) {
+                toast("Could not save the file")
+                return
+            }
+            contentResolver.openOutputStream(uri)?.use { it.write(AppLog.read(this).toByteArray()) }
+            toast("Saved in the Downloads folder")
+        } catch (e: Exception) {
+            toast("Could not save: ${e.message}")
+        }
+    }
+
     // ---- start / stop ----
 
     private fun toggleBridge() {
@@ -241,6 +442,10 @@ class MainActivity : Activity() {
     }
 
     private fun startBridge() {
+        if (prefs.useCode && !Crypto.isValidCode(prefs.code)) {
+            toast("Set the security code first (Settings)")
+            return
+        }
         withPermissions {
             prefs.running = true
             val service = if (prefs.mode == Prefs.MODE_SENDER) {
@@ -257,14 +462,24 @@ class MainActivity : Activity() {
         }
     }
 
-    /** If the e-reader service is already running, restart its connection so a changed setting applies. */
-    private fun applySettingsNow() {
-        if (!prefs.running || prefs.mode != Prefs.MODE_RECEIVER) return
-        try {
-            startForegroundService(Intent(this, ReceiverService::class.java))
-        } catch (e: Exception) {
-            toast("Press Stop and Start to apply the change")
-        }
+    /** If the bridge is running, restart it so a changed setting (code on/off, new code) applies. */
+    private fun restartBridge() {
+        if (!prefs.running) return
+        stopService(Intent(this, SenderService::class.java))
+        stopService(Intent(this, ReceiverService::class.java))
+        ui.postDelayed({
+            if (!prefs.running) return@postDelayed
+            val service = if (prefs.mode == Prefs.MODE_SENDER) {
+                SenderService::class.java
+            } else {
+                ReceiverService::class.java
+            }
+            try {
+                startForegroundService(Intent(this, service))
+            } catch (e: Exception) {
+                toast("Press Stop and Start to apply the change")
+            }
+        }, 700)
     }
 
     private fun stopBridge() {
@@ -278,6 +493,7 @@ class MainActivity : Activity() {
         stopBridge()
         prefs.mode = null
         receiverSetup = null
+        screen = SCREEN_MAIN
         render()
     }
 
@@ -364,7 +580,11 @@ class MainActivity : Activity() {
         prefs.peerAddress = entry.key
         prefs.peerName = entry.value
         stopScan()
-        toast("Selected ${entry.value}. Accept the pairing request on both devices.")
+        if (prefs.useCode) {
+            toast("Selected ${entry.value}.")
+        } else {
+            toast("Selected ${entry.value}. Accept the pairing request on both devices.")
+        }
         startBridge()
     }
 
@@ -446,6 +666,12 @@ class MainActivity : Activity() {
         startStopButton?.text = if (prefs.running) "3. Stop" else "3. Start"
     }
 
+    private fun protectionText(): String {
+        if (!prefs.useCode) return "Protection: Bluetooth pairing"
+        return if (Crypto.isValidCode(prefs.code)) "Protection: security code"
+        else "Protection: security code NOT SET - open Settings"
+    }
+
     private fun updateStatus() {
         refreshStartStop()
         val view = statusView ?: return
@@ -455,6 +681,8 @@ class MainActivity : Activity() {
                 sb.append("Notification access: ")
                     .append(if (isListenerEnabled()) "on" else "OFF - do step 1")
                     .append('\n')
+                    .append(protectionText())
+                    .append('\n')
                     .append("Status: ")
                     .append(if (prefs.running) Bridge.senderStatus else "stopped")
                 if (prefs.allowed.isEmpty()) sb.append("\nNo apps chosen yet - pick apps below")
@@ -462,6 +690,8 @@ class MainActivity : Activity() {
             Prefs.MODE_RECEIVER -> {
                 sb.append("Phone: ")
                     .append(prefs.peerName ?: "not selected")
+                    .append('\n')
+                    .append(protectionText())
                     .append('\n')
                     .append("Status: ")
                     .append(if (prefs.running) Bridge.receiverStatus else "stopped")
@@ -540,4 +770,17 @@ class MainActivity : Activity() {
             isAllCaps = false
             setOnClickListener { onClick() }
         }
+
+    /** Buttons side by side, sharing the width equally. */
+    private fun buttonRow(vararg items: Pair<String, () -> Unit>): LinearLayout {
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        for ((text, action) in items) {
+            row.addView(
+                button(text, action),
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            )
+        }
+        return row
+    }
 }

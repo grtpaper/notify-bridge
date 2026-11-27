@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationManager
 import android.app.Service
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCharacteristic
@@ -18,7 +19,10 @@ import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.BluetoothLeAdvertiser
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Handler
@@ -30,8 +34,15 @@ import android.os.ParcelUuid
  * Phone side. Runs a BLE GATT server with one notify characteristic and advertises it.
  * The e-reader connects, subscribes, and receives every queued notification as BLE frames.
  *
- * The notification descriptor requires an encrypted link, so Android makes the e-reader pair with
- * the phone (the phone shows a pairing request) before it can subscribe.
+ * Two protection modes, chosen by the "security code" setting:
+ *
+ * - Pairing (default): the notification descriptor requires an encrypted link, so Android makes the
+ *   e-reader pair with the phone (a pairing request is shown) before it can subscribe.
+ * - Security code: no pairing. Anyone can subscribe, but every message is encrypted with a key made
+ *   from the shared code, so only a device that knows the code can read it.
+ *
+ * The newest device to subscribe replaces the previous one, so a stale connection never blocks
+ * the e-reader from reconnecting.
  */
 @SuppressLint("MissingPermission")
 class SenderService : Service() {
@@ -62,6 +73,19 @@ class SenderService : Service() {
     private var attempts = 0
     private var inFlight = false
 
+    private val bluetoothReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> onBluetoothOff()
+                BluetoothAdapter.STATE_ON -> {
+                    log("Bluetooth turned on")
+                    main.postDelayed({ startUp() }, 1000)
+                }
+            }
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -74,10 +98,17 @@ class SenderService : Service() {
         } else {
             startForeground(NOTIF_ID, n)
         }
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(bluetoothReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(bluetoothReceiver, filter)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         stopping = false
+        log("Starting (${if (Prefs(this).useCode) "security code mode" else "pairing mode"})")
         startUp()
         return START_STICKY
     }
@@ -87,25 +118,43 @@ class SenderService : Service() {
         instance = null
         main.removeCallbacksAndMessages(null)
         try {
+            unregisterReceiver(bluetoothReceiver)
+        } catch (e: Exception) {
+            // Not registered.
+        }
+        try {
             advertiser?.stopAdvertising(advCallback)
             server?.close()
-        } catch (e: SecurityException) {
-            // Permission revoked while running; nothing left to clean up.
+        } catch (e: Exception) {
+            // Permission revoked or Bluetooth off; nothing left to clean up.
         }
         server = null
+        log("Stopped")
         Bridge.senderStatus = "Stopped"
         super.onDestroy()
     }
 
+    private fun log(text: String) = AppLog.add(this, "S: $text")
+
     /** Called by NotificationForwarder (and the test button) from any thread. */
     fun enqueue(message: Message) {
-        val payload = Protocol.encode(message)
+        val prefs = Prefs(this)
+        var payload = Protocol.encode(message)
+        if (prefs.useCode) {
+            if (!Crypto.isValidCode(prefs.code)) {
+                log("Message dropped: security code is not set")
+                return
+            }
+            payload = Crypto.encrypt(payload, prefs.code)
+        }
+        val finalPayload = payload
         main.post {
-            pending.addLast(payload)
+            pending.addLast(finalPayload)
             while (pending.size > MAX_PENDING) {
                 // If the head is mid-send, drop the next-oldest instead.
                 pending.removeAt(if (frames != null) 1 else 0)
             }
+            log("Message queued (${pending.size} waiting)")
             pump()
         }
     }
@@ -114,6 +163,12 @@ class SenderService : Service() {
 
     private fun startUp() {
         if (server != null || stopping) return
+        val prefs = Prefs(this)
+        if (prefs.useCode && !Crypto.isValidCode(prefs.code)) {
+            setStatus("Set a security code in Settings")
+            main.postDelayed({ startUp() }, 5000)
+            return
+        }
         val bm = getSystemService(BluetoothManager::class.java)
         val adapter = bm?.adapter
         if (bm == null || adapter == null || !adapter.isEnabled) {
@@ -125,6 +180,7 @@ class SenderService : Service() {
             val srv = bm.openGattServer(this, serverCallback)
             if (srv == null) {
                 setStatus("Could not open Bluetooth server")
+                log("openGattServer returned null")
                 main.postDelayed({ startUp() }, 5000)
                 return
             }
@@ -133,20 +189,43 @@ class SenderService : Service() {
                 BluetoothGattCharacteristic.PROPERTY_NOTIFY,
                 0
             )
-            ch.addDescriptor(
-                BluetoothGattDescriptor(
-                    Protocol.CCCD_UUID,
-                    BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED or
-                        BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED
-                )
-            )
+            val permissions = if (prefs.useCode) {
+                BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
+            } else {
+                BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED or
+                    BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED
+            }
+            ch.addDescriptor(BluetoothGattDescriptor(Protocol.CCCD_UUID, permissions))
             val svc = BluetoothGattService(Protocol.SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
             svc.addCharacteristic(ch)
             notifyChar = ch
             server = srv
             srv.addService(svc)
+            log("Bluetooth server opened")
         } catch (e: SecurityException) {
             setStatus("Bluetooth permission missing")
+            log("Bluetooth permission missing")
+        }
+    }
+
+    private fun onBluetoothOff() {
+        log("Bluetooth turned off")
+        main.post {
+            try {
+                advertiser?.stopAdvertising(advCallback)
+                server?.close()
+            } catch (e: Exception) {
+                // Bluetooth is already shutting down.
+            }
+            server = null
+            notifyChar = null
+            advertiser = null
+            mtus.clear()
+            clearTarget()
+            if (!stopping) {
+                setStatus("Bluetooth is off - turn it on")
+                main.postDelayed({ startUp() }, 5000)
+            }
         }
     }
 
@@ -155,6 +234,7 @@ class SenderService : Service() {
         val adv = adapter.bluetoothLeAdvertiser
         if (adv == null) {
             setStatus("This phone cannot advertise over Bluetooth LE")
+            log("No BLE advertiser available")
             return
         }
         advertiser = adv
@@ -176,17 +256,25 @@ class SenderService : Service() {
             adv.startAdvertising(settings, data, scanResponse, advCallback)
         } catch (e: SecurityException) {
             setStatus("Bluetooth permission missing")
+        } catch (e: IllegalStateException) {
+            log("Advertising error: ${e.message}")
         }
     }
 
     private val advCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
-            main.post { if (target == null) setStatus("Waiting for e-reader...") }
+            main.post {
+                log("Advertising started")
+                if (target == null) setStatus("Waiting for e-reader...")
+            }
         }
 
         override fun onStartFailure(errorCode: Int) {
             if (errorCode == ADVERTISE_FAILED_ALREADY_STARTED) return
-            main.post { setStatus("Advertising failed (code $errorCode)") }
+            main.post {
+                log("Advertising failed (code $errorCode)")
+                setStatus("Advertising failed (code $errorCode)")
+            }
         }
     }
 
@@ -195,13 +283,18 @@ class SenderService : Service() {
     private val serverCallback = object : BluetoothGattServerCallback() {
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
             main.post {
-                if (status == BluetoothGatt.GATT_SUCCESS) startAdvertising(false)
-                else setStatus("Could not add Bluetooth service ($status)")
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    startAdvertising(false)
+                } else {
+                    log("Could not add service ($status)")
+                    setStatus("Could not add Bluetooth service ($status)")
+                }
             }
         }
 
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             main.post {
+                log("Connection state=$newState status=$status device=${device.address}")
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     if (target == null) setStatus("Device connected, waiting for it to subscribe...")
                 } else {
@@ -250,15 +343,22 @@ class SenderService : Service() {
                 } else if (value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
                     val current = target
                     if (current != null && current != device) {
-                        // Only one e-reader at a time.
-                        result = BluetoothGatt.GATT_FAILURE
-                    } else {
-                        target = device
-                        targetMtu = mtus[device.address] ?: Protocol.DEFAULT_MTU
-                        setStatus("E-reader connected")
+                        // The newest device wins, so a stale connection cannot block the e-reader.
+                        log("New device subscribed, dropping the old one")
+                        try {
+                            server?.cancelConnection(current)
+                        } catch (e: SecurityException) {
+                            // Permission revoked.
+                        }
+                        clearTarget()
                     }
+                    target = device
+                    targetMtu = mtus[device.address] ?: Protocol.DEFAULT_MTU
+                    log("E-reader subscribed (mtu=$targetMtu)")
+                    setStatus("E-reader connected")
                 } else if (device == target) {
                     clearTarget()
+                    log("E-reader unsubscribed")
                     setStatus("E-reader unsubscribed")
                 }
                 if (responseNeeded) {
@@ -281,11 +381,13 @@ class SenderService : Service() {
                     val f = frames
                     if (f != null && frameIndex >= f.size) {
                         pending.removeFirstOrNull()
+                        log("Message sent (${f.size} frames, ${pending.size} waiting)")
                         frames = null
                         frameIndex = 0
                     }
                     pump()
                 } else {
+                    log("Sending failed (status $status)")
                     onSendFailed()
                 }
             }
@@ -330,6 +432,7 @@ class SenderService : Service() {
         if (attempts >= MAX_ATTEMPTS) {
             pending.removeFirstOrNull()
             attempts = 0
+            log("Gave up on a message after $MAX_ATTEMPTS attempts")
         }
         main.postDelayed({ pump() }, 1000)
     }

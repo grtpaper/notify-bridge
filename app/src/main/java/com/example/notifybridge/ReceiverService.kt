@@ -17,7 +17,10 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Handler
@@ -26,16 +29,16 @@ import android.os.Looper
 import android.os.ParcelUuid
 
 /**
- * E-reader side. Connects to the phone chosen on the main screen, subscribes to its notify
- * characteristic, and turns every received message into a normal Android notification.
+ * E-reader side. Finds the phone by scanning for its Bluetooth LE advertisement, connects directly
+ * to the address the phone is using right now (phones change their address every few minutes),
+ * subscribes to its notify characteristic, and turns every received message into a normal Android
+ * notification that is also saved in the message list.
  *
- * Two connection styles, chosen by the "Reconnect by scanning" setting:
+ * If the phone is not found, scans repeat with a growing pause (3 seconds up to 3 minutes) so the
+ * battery is spared. Switching Bluetooth off and on is noticed and the connection is rebuilt.
  *
- * - Scanning (default): look for the phone's Bluetooth LE advertisement in short scans and connect
- *   directly to the address it is using right now. Phones change their Bluetooth address every few
- *   minutes, and some e-readers cannot match the new address to a saved pairing, so waiting for the
- *   saved pairing can hang forever. Scans repeat with a growing pause so the battery is spared.
- * - Classic (old behaviour): connectGatt with autoConnect to the saved pairing and wait.
+ * With "security code" on, no Bluetooth pairing is needed: messages arrive encrypted and are
+ * decrypted with the shared code.
  */
 @SuppressLint("MissingPermission")
 class ReceiverService : Service() {
@@ -45,12 +48,6 @@ class ReceiverService : Service() {
         private const val SCAN_WINDOW_MS = 10_000L
         private const val SETUP_TIMEOUT_MS = 60_000L // includes time to accept a pairing request
         private val BACKOFF_MS = longArrayOf(3_000, 5_000, 10_000, 20_000, 40_000, 60_000, 120_000, 180_000)
-        private const val FAILURES_BEFORE_REPAIR = 2
-
-        // GATT status codes that mean the saved pairing keys are no longer accepted.
-        private const val GATT_INSUFFICIENT_AUTHENTICATION = 5
-        private const val GATT_INSUFFICIENT_ENCRYPTION = 15
-        private const val GATT_AUTH_FAIL = 137
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -63,11 +60,25 @@ class ReceiverService : Service() {
 
     private var subscribed = false
     private var backoffStep = 0
-    private var failures = 0
 
     private val reconnect = Runnable { connect() }
     private val scanTimeout = Runnable { onScanWindowEnded() }
     private val setupTimeout = Runnable { onSetupTimedOut() }
+
+    private val bluetoothReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> onBluetoothOff()
+                BluetoothAdapter.STATE_ON -> {
+                    log("Bluetooth turned on")
+                    backoffStep = 0
+                    main.removeCallbacks(reconnect)
+                    main.postDelayed(reconnect, 1500)
+                }
+            }
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -80,12 +91,18 @@ class ReceiverService : Service() {
         } else {
             startForeground(NOTIF_ID, n)
         }
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(bluetoothReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(bluetoothReceiver, filter)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         stopping = false
         backoffStep = 0
-        failures = 0
+        log("Starting (${if (Prefs(this).useCode) "security code mode" else "pairing mode"})")
         connect()
         return START_STICKY
     }
@@ -93,10 +110,32 @@ class ReceiverService : Service() {
     override fun onDestroy() {
         stopping = true
         main.removeCallbacksAndMessages(null)
+        try {
+            unregisterReceiver(bluetoothReceiver)
+        } catch (e: Exception) {
+            // Not registered.
+        }
         stopScan()
         closeGatt()
+        log("Stopped")
         Bridge.receiverStatus = "Stopped"
         super.onDestroy()
+    }
+
+    private fun log(text: String) = AppLog.add(this, "R: $text")
+
+    private fun onBluetoothOff() {
+        log("Bluetooth turned off")
+        main.post {
+            if (stopping) return@post
+            main.removeCallbacks(reconnect)
+            main.removeCallbacks(setupTimeout)
+            stopScan()
+            closeGatt()
+            subscribed = false
+            setStatus("Bluetooth is off - turn it on")
+            main.postDelayed(reconnect, 5000)
+        }
     }
 
     // ---- connection ----
@@ -109,13 +148,18 @@ class ReceiverService : Service() {
             setStatus("No phone selected - tap Find phone")
             return
         }
+        if (prefs.useCode && !Crypto.isValidCode(prefs.code)) {
+            setStatus("Set the security code in Settings")
+            main.postDelayed(reconnect, 5000)
+            return
+        }
         val adapter = getSystemService(BluetoothManager::class.java)?.adapter
         if (adapter == null || !adapter.isEnabled) {
             setStatus("Bluetooth is off - turn it on")
             main.postDelayed(reconnect, 5000)
             return
         }
-        if (prefs.directConnect) startScan(prefs, adapter) else connectClassic(prefs, adapter)
+        startScan(prefs, adapter)
     }
 
     private fun closeGatt() {
@@ -127,32 +171,6 @@ class ReceiverService : Service() {
         gatt = null
     }
 
-    /** Old behaviour: connect to the saved pairing with autoConnect and wait for the phone. */
-    private fun connectClassic(prefs: Prefs, adapter: BluetoothAdapter) {
-        val address = prefs.peerAddress ?: return
-        try {
-            var device = adapter.getRemoteDevice(address)
-            if (device.bondState != BluetoothDevice.BOND_BONDED) {
-                // The phone's address can change when pairing completes; look it up by name.
-                val name = prefs.peerName
-                val match = adapter.bondedDevices.firstOrNull { name != null && it.name == name }
-                if (match != null) {
-                    device = match
-                    prefs.peerAddress = match.address
-                }
-            }
-            closeGatt()
-            reassembler.reset()
-            setStatus("Connecting to ${prefs.peerName ?: device.address}...")
-            val bonded = device.bondState == BluetoothDevice.BOND_BONDED
-            gatt = device.connectGatt(this, bonded, callback, BluetoothDevice.TRANSPORT_LE)
-        } catch (e: SecurityException) {
-            setStatus("Bluetooth permission missing")
-        } catch (e: IllegalArgumentException) {
-            setStatus("Saved phone address is invalid - tap Find phone")
-        }
-    }
-
     // ---- scanning ----
 
     private fun startScan(prefs: Prefs, adapter: BluetoothAdapter) {
@@ -162,6 +180,7 @@ class ReceiverService : Service() {
         val sc = adapter.bluetoothLeScanner
         if (sc == null) {
             setStatus("Bluetooth LE scanning is not available - retrying")
+            log("No BLE scanner available")
             main.postDelayed(reconnect, 10_000)
             return
         }
@@ -171,10 +190,12 @@ class ReceiverService : Service() {
             sc.startScan(listOf(filter), settings, scanCallback)
             scanner = sc
             scanning = true
+            log("Scanning for ${prefs.peerName ?: "phone"}")
             setStatus("Looking for ${prefs.peerName ?: "phone"}...")
             main.postDelayed(scanTimeout, SCAN_WINDOW_MS)
         } catch (e: SecurityException) {
             setStatus("Bluetooth permission missing")
+            log("Bluetooth permission missing")
         } catch (e: IllegalStateException) {
             // Bluetooth switched off while starting the scan.
             main.postDelayed(reconnect, 5_000)
@@ -202,6 +223,7 @@ class ReceiverService : Service() {
         override fun onScanFailed(errorCode: Int) {
             main.post {
                 if (stopping) return@post
+                log("Scan failed (code $errorCode)")
                 stopScan()
                 scheduleRetry("Scan failed ($errorCode)")
             }
@@ -216,16 +238,24 @@ class ReceiverService : Service() {
             prefs.peerName == null || name == null || name == prefs.peerName
         if (!isOurPhone) return
         stopScan()
-        connectDirect(result.device, prefs.peerName ?: name ?: result.device.address)
+        log("Found ${name ?: "phone"} at ${result.device.address} (signal ${result.rssi}, saved pairing: ${bondText(result.device)})")
+        connectTo(result.device, prefs.peerName ?: name ?: result.device.address)
+    }
+
+    private fun bondText(d: BluetoothDevice): String = when (d.bondState) {
+        BluetoothDevice.BOND_BONDED -> "yes"
+        BluetoothDevice.BOND_BONDING -> "pairing now"
+        else -> "no"
     }
 
     private fun onScanWindowEnded() {
         if (!scanning || stopping) return
         stopScan()
+        log("Phone not found in this scan")
         scheduleRetry("Phone not found")
     }
 
-    private fun connectDirect(device: BluetoothDevice, label: String) {
+    private fun connectTo(device: BluetoothDevice, label: String) {
         closeGatt()
         reassembler.reset()
         subscribed = false
@@ -236,71 +266,26 @@ class ReceiverService : Service() {
             main.postDelayed(setupTimeout, SETUP_TIMEOUT_MS)
         } catch (e: SecurityException) {
             setStatus("Bluetooth permission missing")
+            log("Bluetooth permission missing")
         }
     }
 
     private fun onSetupTimedOut() {
         if (stopping || subscribed) return
-        val dev = gatt?.device
+        log("Connection setup timed out")
         closeGatt()
-        linkFailed(dev, false, "Connection timed out")
+        scheduleRetry("Connection timed out")
     }
 
     /** Waits a growing amount of time (3 seconds up to 3 minutes) before looking for the phone again. */
     private fun scheduleRetry(note: String) {
         if (stopping) return
+        main.removeCallbacks(setupTimeout)
         val delay = BACKOFF_MS[backoffStep.coerceAtMost(BACKOFF_MS.size - 1)]
         if (backoffStep < BACKOFF_MS.size - 1) backoffStep++
         setStatus("$note - trying again in ${delay / 1000}s")
         main.removeCallbacks(reconnect)
         main.postDelayed(reconnect, delay)
-    }
-
-    /** A connection attempt failed before notifications were set up. Maybe repair the pairing. */
-    private fun linkFailed(device: BluetoothDevice?, authProblem: Boolean, note: String) {
-        main.removeCallbacks(setupTimeout)
-        failures++
-        val prefs = Prefs(this)
-        if (prefs.autoFixPairing && (authProblem || failures >= FAILURES_BEFORE_REPAIR)) {
-            val result = repairPairing(device, prefs.peerName)
-            if (result != null) {
-                failures = 0
-                backoffStep = 0
-                scheduleRetry(result)
-                return
-            }
-        }
-        scheduleRetry(note)
-    }
-
-    /**
-     * Deletes the saved pairing with the phone so Android pairs again from scratch.
-     * Returns a status message, or null if there was no saved pairing to remove.
-     * Android hides this function from apps, so on some e-readers it does not work.
-     */
-    private fun repairPairing(device: BluetoothDevice?, phoneName: String?): String? {
-        val adapter = getSystemService(BluetoothManager::class.java)?.adapter ?: return null
-        val targets = LinkedHashSet<BluetoothDevice>()
-        if (device != null && device.bondState != BluetoothDevice.BOND_NONE) targets.add(device)
-        try {
-            adapter.bondedDevices?.filterTo(targets) { phoneName != null && it.name == phoneName }
-        } catch (e: SecurityException) {
-            return null
-        }
-        if (targets.isEmpty()) return null
-        var removed = false
-        for (d in targets) if (removeBond(d)) removed = true
-        return if (removed) {
-            "Removed old pairing, pairing again"
-        } else {
-            "Could not repair pairing: forget ${phoneName ?: "the phone"} in Bluetooth settings"
-        }
-    }
-
-    private fun removeBond(d: BluetoothDevice): Boolean = try {
-        d.javaClass.getMethod("removeBond").invoke(d) as? Boolean ?: false
-    } catch (e: Exception) {
-        false
     }
 
     // ---- GATT callbacks ----
@@ -312,35 +297,39 @@ class ReceiverService : Service() {
                     g.close()
                     return@post
                 }
+                log("Connection state=$newState status=$status")
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     setStatus("Connected, setting up...")
                     if (!g.requestMtu(Protocol.REQUESTED_MTU)) g.discoverServices()
                 } else {
-                    val dev = g.device
                     g.close()
                     gatt = null
                     if (stopping) return@post
-                    if (Prefs(this@ReceiverService).directConnect) {
-                        if (subscribed) {
-                            // Was working and the link dropped: start over quickly.
-                            subscribed = false
-                            backoffStep = 0
-                            failures = 0
-                            setStatus("Disconnected - looking for phone...")
-                            main.postDelayed(reconnect, 2_000)
-                        } else {
-                            linkFailed(dev, false, "Connection failed ($status)")
-                        }
+                    if (subscribed) {
+                        // Was working and the link dropped: start looking again quickly.
+                        subscribed = false
+                        backoffStep = 0
+                        setStatus("Disconnected - looking for phone...")
+                        main.removeCallbacks(reconnect)
+                        main.postDelayed(reconnect, 2_000)
                     } else {
-                        setStatus("Disconnected - reconnecting...")
-                        main.postDelayed(reconnect, 3000)
+                        if (status == 133) {
+                            log("Status 133 usually means an old Bluetooth pairing is blocking the " +
+                                "connection. Forget the phone in Bluetooth settings on both devices, " +
+                                "or turn on the security code in Settings on both.")
+                        }
+                        scheduleRetry("Connection failed ($status)")
                     }
                 }
             }
         }
 
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
-            main.post { if (g === gatt) g.discoverServices() }
+            main.post {
+                if (g !== gatt) return@post
+                log("MTU $mtu (status $status)")
+                g.discoverServices()
+            }
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
@@ -349,12 +338,13 @@ class ReceiverService : Service() {
                 val ch = g.getService(Protocol.SERVICE_UUID)?.getCharacteristic(Protocol.NOTIFY_CHAR_UUID)
                 val cccd = ch?.getDescriptor(Protocol.CCCD_UUID)
                 if (status != BluetoothGatt.GATT_SUCCESS || ch == null || cccd == null) {
+                    log("Phone service not found (status $status)")
                     setStatus("Phone service not found")
                     g.disconnect()
                     return@post
                 }
                 g.setCharacteristicNotification(ch, true)
-                // If the phone requires pairing, Android shows the pairing request here.
+                // In pairing mode, Android shows the pairing request here.
                 writeCccd(g, cccd)
             }
         }
@@ -362,24 +352,16 @@ class ReceiverService : Service() {
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             main.post {
                 if (g !== gatt) return@post
-                val prefs = Prefs(this@ReceiverService)
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     subscribed = true
-                    failures = 0
                     backoffStep = 0
                     main.removeCallbacks(setupTimeout)
-                    if (!prefs.directConnect) prefs.peerAddress = g.device.address
+                    log("Subscribed to the phone")
                     setStatus("Connected to phone")
-                } else if (prefs.directConnect) {
-                    val dev = g.device
-                    closeGatt()
-                    val authProblem = status == GATT_INSUFFICIENT_AUTHENTICATION ||
-                        status == GATT_INSUFFICIENT_ENCRYPTION ||
-                        status == GATT_AUTH_FAIL
-                    linkFailed(dev, authProblem, "Pairing or subscribe failed ($status)")
                 } else {
-                    setStatus("Pairing or subscribe failed ($status)")
-                    g.disconnect()
+                    log("Subscribe failed (status $status)")
+                    closeGatt()
+                    scheduleRetry("Subscribe failed ($status)")
                 }
             }
         }
@@ -415,10 +397,38 @@ class ReceiverService : Service() {
         val copy = frame.copyOf()
         main.post {
             val payload = reassembler.feed(copy) ?: return@post
-            val message = Protocol.decode(payload) ?: return@post
+            val message = readPayload(payload) ?: return@post
+            log("Message received")
             History.add(this, message)
             showNotification(message)
         }
+    }
+
+    /** Turns the received bytes into a message, decrypting them if a security code is in use. */
+    private fun readPayload(payload: ByteArray): Message? {
+        val prefs = Prefs(this)
+        val plain: ByteArray = if (Crypto.isEncrypted(payload)) {
+            if (!prefs.useCode) {
+                log("Phone sent an encrypted message but the security code is off here. Turn it on in Settings.")
+                setStatus("Phone uses a security code - turn it on in Settings")
+                return null
+            }
+            Crypto.decrypt(payload, prefs.code) ?: run {
+                log("Could not decrypt a message: the security code is different on the phone")
+                setStatus("Wrong security code")
+                return null
+            }
+        } else {
+            if (prefs.useCode) {
+                log("Phone sent an unprotected message but the security code is on here. Turn it on on the phone too.")
+                setStatus("Phone is not using the security code")
+                return null
+            }
+            payload
+        }
+        val message = Protocol.decode(plain)
+        if (message == null) log("Received a message that could not be read")
+        return message
     }
 
     private fun showNotification(m: Message) {
