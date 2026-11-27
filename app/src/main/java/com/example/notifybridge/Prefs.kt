@@ -54,6 +54,23 @@ class Prefs(context: Context) {
         set(v) {
             p.edit().putString("peerName", v).apply()
         }
+
+    /**
+     * Receiver only: find the phone by scanning and connect to the address it is using right now,
+     * instead of waiting for Android to match a saved pairing. Fixes phones that stop reconnecting.
+     */
+    var directConnect: Boolean
+        get() = p.getBoolean("directConnect", true)
+        set(v) {
+            p.edit().putBoolean("directConnect", v).apply()
+        }
+
+    /** Receiver only: when connecting keeps failing, delete the phone's old pairing and pair again. */
+    var autoFixPairing: Boolean
+        get() = p.getBoolean("autoFixPairing", true)
+        set(v) {
+            p.edit().putBoolean("autoFixPairing", v).apply()
+        }
 }
 
 /** Latest status text, shown on the main screen. */

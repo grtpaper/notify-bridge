@@ -180,6 +180,21 @@ class MainActivity : Activity() {
         root.addView(button("1. Find phone") { startScan() })
         root.addView(button("2. Allow background running") { openBatterySettings() })
         startStopButton = button("3. Start") { toggleBridge() }.also { root.addView(it) }
+        root.addView(CheckBox(this).apply {
+            text = "Reconnect by scanning (turn off to use the old method)"
+            setTextColor(Color.BLACK)
+            isChecked = prefs.directConnect
+            setOnCheckedChangeListener { _, checked ->
+                prefs.directConnect = checked
+                applySettingsNow()
+            }
+        })
+        root.addView(CheckBox(this).apply {
+            text = "Fix a broken pairing automatically (may also remove the phone's pairing used for internet sharing)"
+            setTextColor(Color.BLACK)
+            isChecked = prefs.autoFixPairing
+            setOnCheckedChangeListener { _, checked -> prefs.autoFixPairing = checked }
+        })
         root.addView(label("Phones found (tap yours):", bold = true))
         val adapter = ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, ArrayList<String>())
         foundAdapter = adapter
@@ -239,6 +254,16 @@ class MainActivity : Activity() {
                 toast("Could not start: ${e.message}")
             }
             refreshStartStop()
+        }
+    }
+
+    /** If the e-reader service is already running, restart its connection so a changed setting applies. */
+    private fun applySettingsNow() {
+        if (!prefs.running || prefs.mode != Prefs.MODE_RECEIVER) return
+        try {
+            startForegroundService(Intent(this, ReceiverService::class.java))
+        } catch (e: Exception) {
+            toast("Press Stop and Start to apply the change")
         }
     }
 
